@@ -8,8 +8,6 @@ idna==2.8
 numpy==1.17.3
 opencv-contrib-python==4.1.1.26
 Pillow==6.2.1
-praw==6.4.0
-prawcore==1.0.1
 pycairo==1.18.2
 PyGObject==3.34.0
 python-firebase==1.2
