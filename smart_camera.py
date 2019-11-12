@@ -7,11 +7,10 @@
 # [•∆•] ------> Face Recognition
 # [^∆^] ------> Local Face Repo
 # [•∆•] ------> Offline Survillence
-# [^∆^] --> Todo
-# [•∆•] ------> Integrate with firebase
-# [^∆^] ------> Logging
+# [^∆^] ------> Integrate with firebase
+# [•∆•] ------> NOT DRY JUST KISS
 # ----------------------------------------------------------------
-
+import os
 import gi
 import sys
 import cv2
@@ -21,21 +20,30 @@ import signal
 import platform
 import threading
 import numpy as np
+import configparser
 import face_recognition
 from datetime import datetime, timedelta
+from google.cloud import firestore, storage
+from google.api_core import datetime_helpers
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
 from gi.repository import Gst, GstRtspServer, GLib
 
 Gst.init()
-
+configPath = "config.ini"
 
 # ----------------------------------------------------------------
 # Program Quit & Cleanup
-def wrapItUp(p1, p2):
+def wrap_it_up(p1, p2):
     try:
-        global mainloop
+        save_known_faces()
+        global mainloop, db, bucket, facedata_collection_updater, facedata_collection
+        facedata_collection_updater.unsubscribe()
+        del db
+        del bucket
+        del facedata_collection
+        del facedata_collection_updater
         mainloop.quit()
     except:
         # mainloop was not created
@@ -46,7 +54,7 @@ def wrapItUp(p1, p2):
     quit()
 
 
-signal.signal(signal.SIGINT, wrapItUp)
+signal.signal(signal.SIGINT, wrap_it_up)
 # ----------------------------------------------------------------
 
 
@@ -60,13 +68,26 @@ def running_on_jetson_nano():
 def survillence():
     global camera, offline
     while offline:
+        currentTime = datetime_helpers.utcnow()
         _, frame = camera.read()
         if _:
-            threading.Thread(target=face_recog, args=(frame,), daemon=True).start()
+            threading.Thread(
+                target=face_recog, args=(frame, currentTime), daemon=True
+            ).start()
 
 
-def face_recog(frame):
-    global known_face_encodings, known_face_metadata, thread_counter, debug
+def face_recog(frame, currentTime=None):
+
+    global known_face_encodings, known_face_metadata, thread_counter, debug, db, bucket, devId, frequency
+    log_document_template = {
+        "ImageURL": None,
+        "Labels": [],
+        "Timestamp": currentTime,
+        "UserID": None,
+    }
+    permFileName = (
+        devId + "_" + str(currentTime).replace(" ", "_").replace(":", "_") + ".jpg"
+    )
 
     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
     # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
@@ -82,8 +103,11 @@ def face_recog(frame):
         metadata = lookup_known_face(face_encoding)
         # If we found the face, label the face with some useful information.
         if metadata is not None:
-            time_at_door = datetime.now() - metadata["first_seen_this_interaction"]
+            time_at_door = (
+                datetime_helpers.utcnow() - metadata["first_seen_this_interaction"]
+            )
             face_label = f"At door {int(time_at_door.total_seconds())}s"
+            face_label = metadata["name"]
         # If this is a brand new face, add it to our list of known faces
         else:
             face_label = "New visitor!"
@@ -95,6 +119,7 @@ def face_recog(frame):
             register_new_face(face_encoding, face_image)
 
         face_labels.append(face_label)
+        log_document_template["Labels"].append(face_label)
     # Draw a box around each face and label each face
     for (top, right, bottom, left), face_label in zip(face_locations, face_labels):
         # Scale back up face locations since the frame we detected in was scaled to 1/4 size
@@ -117,47 +142,79 @@ def face_recog(frame):
             (255, 255, 255),
             1,
         )
-    # Display recent visitor images
-    number_of_recent_visitors = 0
-    for metadata in known_face_metadata:
-        # If we have seen this person in the last minute, draw their image
-        if (
-            datetime.now() - metadata["last_seen"] < timedelta(seconds=10)
-            and metadata["seen_frames"] > 5
-        ):
-            # Draw the known face image
-            x_position = number_of_recent_visitors * 150
-            frame[30:180, x_position : x_position + 150] = metadata["face_image"]
-            number_of_recent_visitors += 1
-            # Label the image with how many times they have visited
-            visits = metadata["seen_count"]
-            visit_label = f"{visits} visits"
-            if visits == 1:
-                visit_label = "First visit"
-            cv2.putText(
-                frame,
-                visit_label,
-                (x_position + 10, 170),
-                cv2.FONT_HERSHEY_DUPLEX,
-                0.6,
-                (255, 255, 255),
-                1,
-            )
-    if number_of_recent_visitors > 0:
-        cv2.putText(
-            frame,
-            "Visitors at Door",
-            (5, 18),
-            cv2.FONT_HERSHEY_DUPLEX,
-            0.8,
-            (255, 255, 255),
-            1,
-        )
-    if debug:
-        thread_counter += 1
-        if thread_counter % 100 == 0:
+
+    thread_counter += 1
+
+    if thread_counter % frequency == 0:
+        if debug:
             print("Total threads completed :", thread_counter)
+
+        if logging:
+            cv2.imwrite(permFileName, frame)
+            blob = bucket.blob(permFileName)
+            blob.upload_from_filename(permFileName)
+            intruder_collection = db.collection(parser["CLOUD_CONFIG"].get("LOG"))
+            tempIntruderLogDocument = intruder_collection.document(
+                devId + " " + str(currentTime)
+            )
+            log_document_template["ImageURL"] = blob.media_link
+            log_document_template["UserID"] = devId
+            tempIntruderLogDocument.create(log_document_template)
+            os.remove(permFileName)
+            del log_document_template
+            del tempIntruderLogDocument
+            del intruder_collection
+
     return frame
+
+
+def register_new_face(face_encoding, face_image):
+
+    global db, bucket, facedata_collection
+    document = facedata_collection.document()
+
+    """
+    Add a new person to our list of known faces
+    """
+    # Add the face encoding to the list of known faces
+    known_face_encodings.append(face_encoding)
+    # Add a matching dictionary entry to our metadata list.
+    # We can use this to keep track of how many times a person has visited, when we last saw them, etc.
+    known_face_metadata.append(
+        {
+            "first_seen": datetime_helpers.utcnow(),
+            "last_seen": datetime_helpers.utcnow(),
+            "first_seen_this_interaction": datetime_helpers.utcnow(),
+            "seen_count": 1,
+            "seen_frames": 1,
+            "face_image": face_image,
+            "name": "Unknown",
+            "uuid": document.id,
+        }
+    )
+
+    permFileName = document.id + "_faceImage.jpg"
+    cv2.imwrite(permFileName, face_image)
+    blob = bucket.blob(permFileName)
+    blob.upload_from_filename(permFileName)
+
+    facedata_document_template = {
+        "FaceEncodingString": face_encoding.tostring(),
+        "FirstSeen": datetime_helpers.utcnow(),
+        "ImageURI": blob.media_link,
+        "FirstSeenThisInteraction": datetime_helpers.utcnow(),
+        "LastSeen": datetime_helpers.utcnow(),
+        "UserSetLabels": ["Unknown"],
+        "SeenCount": 1,
+        "SeenFrames": 1,
+    }
+
+    document.create(facedata_document_template)
+    os.remove(permFileName)
+    save_known_faces()
+
+    if debug:
+        print("New Face added")
 
 
 def save_known_faces():
@@ -168,38 +225,37 @@ def save_known_faces():
 
 
 def load_known_faces():
-    global known_face_encodings, known_face_metadata
+    global known_face_encodings, known_face_metadata, downloading
 
     try:
         with open("known_faces.dat", "rb") as face_data_file:
             known_face_encodings, known_face_metadata = pickle.load(face_data_file)
             print("Known faces loaded from disk.")
     except FileNotFoundError as e:
-        print("No previous face data found - starting with a blank known face list.")
+        print(
+            "No previous face data found - starting with a blank known face list.\nTry to sync from cloud with sync_it_up module\n"
+        )
         pass
 
 
-def register_new_face(face_encoding, face_image):
-    """
-    Add a new person to our list of known faces
-    """
-    # Add the face encoding to the list of known faces
-    known_face_encodings.append(face_encoding)
-    # Add a matching dictionary entry to our metadata list.
-    # We can use this to keep track of how many times a person has visited, when we last saw them, etc.
-    known_face_metadata.append(
-        {
-            "first_seen": datetime.now(),
-            "first_seen_this_interaction": datetime.now(),
-            "last_seen": datetime.now(),
-            "seen_count": 1,
-            "seen_frames": 1,
-            "face_image": face_image,
-        }
-    )
+def update_metadata(collection_snapshot, changes, read_time):
+
+    global db, bucket, known_face_metadata, debug
+
+    for docIndex in range(len(collection_snapshot)):
+        cloudSnapshotID = collection_snapshot[docIndex].id
+        cloudSnapshot = collection_snapshot[docIndex].to_dict()
+        for docId in range(len(known_face_metadata)):
+            if known_face_metadata[docId]["uuid"] == cloudSnapshotID:
+                known_face_metadata[docId]["name"] = cloudSnapshot["UserSetLabels"][0]
+                if debug:
+                    print("Metadata of id {} has been updated".format(cloudSnapshotID))
+
+    save_known_faces()
 
 
 def lookup_known_face(face_encoding):
+    global facedata_collection
     """
     See if this is a face we already have in our face list
     """
@@ -227,17 +283,28 @@ def lookup_known_face(face_encoding):
         metadata = known_face_metadata[best_match_index]
 
         # Update the metadata for the face so we can keep track of how recently we have seen this face.
-        metadata["last_seen"] = datetime.now()
+        metadata["last_seen"] = datetime_helpers.utcnow()
         metadata["seen_frames"] += 1
 
         # We'll also keep a total "seen count" that tracks how many times this person has come to the door.
         # But we can say that if we have seen this person within the last 5 minutes, it is still the same
         # visit, not a new visit. But if they go away for awhile and come back, that is a new visit.
-        if datetime.now() - metadata["first_seen_this_interaction"] > timedelta(
-            minutes=5
-        ):
-            metadata["first_seen_this_interaction"] = datetime.now()
+        if datetime_helpers.utcnow() - metadata[
+            "first_seen_this_interaction"
+        ] > timedelta(minutes=2):
+            metadata["first_seen_this_interaction"] = datetime_helpers.utcnow()
             metadata["seen_count"] += 1
+
+            tempDoc = facedata_collection.document(metadata["uuid"])
+            tempDoc.update(
+                {
+                    "SeenCount": metadata["seen_count"],
+                    "LastSeen": metadata["last_seen"],
+                    "SeenFrames": metadata["seen_frames"],
+                    "FirstSeenThisInteraction": metadata["first_seen_this_interaction"],
+                }
+            )
+            del tempDoc
 
     return metadata
 
@@ -286,10 +353,11 @@ class SensorFactory(GstRtspServer.RTSPMediaFactory):
     def on_need_data(self, src, lenght):
         global offline
         if self.cap.isOpened():
+            currentTime = datetime_helpers.utcnow()
             ret, frame = self.cap.read()
             if ret:
                 # Resize frame of video to 1/4 size for faster face recognition processing
-                frame = face_recog(frame)
+                frame = face_recog(frame, currentTime)
                 data = frame.tostring()
                 buf = Gst.Buffer.new_allocate(None, len(data), None)
                 buf.fill(0, data)
@@ -355,21 +423,46 @@ if __name__ == "__main__":
         thread_counter = 0
     except:
         pass
+
+    # read firebase config from setup dir
+
+    parser = configparser.ConfigParser()
+    if parser.read(configPath)[-1] == "config.ini":
+        # Loading app configuration from config.ini
+        filePath = parser["CLOUD_CONFIG"].get("SFP")
+        projectName = parser["CLOUD_CONFIG"].get("PJN")
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(filePath)
+        # Throws a exception if there is no internet connection
+        devId = parser["APP_CONFIG"].get("CameraName")
+        db = firestore.Client()
+        image_bucket = storage.Client()
+        bucket = image_bucket.get_bucket(projectName + ".appspot.com")
+        frequency = int(parser["APP_CONFIG"].get("FUP"))
+        logging = True
+    else:
+        logging = False
+
     camera = None
     if running_on_jetson_nano():
         camera = cv2.VideoCapture(get_jetson_gstreamer_source(), cv2.CAP_GSTREAMER)
+
     else:
         camera = cv2.VideoCapture(0)
+
     if debug:
         if camera is not None:
+            deviceSet = True
             print("Camera Initialized")
         else:
+            deviceSet = False
             print("Error Initializing Camera..\nExiting")
             exit()
 
-    streamer = {}
     known_face_encodings = []
     known_face_metadata = []
+    load_known_faces()
+    facedata_collection = db.collection(parser["CLOUD_CONFIG"].get("FAD"))
+    facedata_collection_updater = facedata_collection.on_snapshot(update_metadata)
     server = GstServer()
     server.connect("client-connected", route2stream, None)
     offline = True
