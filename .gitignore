@@ -1,4 +1,4 @@
 *.json
 *.ini
 *.dat
-./__pycache__/
+__pycache__/
