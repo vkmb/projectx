@@ -103,9 +103,9 @@ def face_recog(frame, currentTime=None):
         metadata = lookup_known_face(face_encoding)
         # If we found the face, label the face with some useful information.
         if metadata is not None:
-            time_at_door = (
-                datetime_helpers.utcnow() - metadata["first_seen_this_interaction"]
-            )
+            time_at_door = datetime_helpers.utcnow() - metadata[
+                "first_seen_this_interaction"
+            ].replace(tzinfo=None)
             face_label = f"At door {int(time_at_door.total_seconds())}s"
             face_label = metadata["name"]
         # If this is a brand new face, add it to our list of known faces
@@ -289,9 +289,9 @@ def lookup_known_face(face_encoding):
         # We'll also keep a total "seen count" that tracks how many times this person has come to the door.
         # But we can say that if we have seen this person within the last 5 minutes, it is still the same
         # visit, not a new visit. But if they go away for awhile and come back, that is a new visit.
-        if datetime_helpers.utcnow() - metadata[
-            "first_seen_this_interaction"
-        ] > timedelta(minutes=2):
+        if datetime_helpers.utcnow() - metadata["first_seen_this_interaction"].replace(
+            tzinfo=None
+        ) > timedelta(minutes=2):
             metadata["first_seen_this_interaction"] = datetime_helpers.utcnow()
             metadata["seen_count"] += 1
 
@@ -436,7 +436,7 @@ if __name__ == "__main__":
         devId = parser["APP_CONFIG"].get("CameraName")
         db = firestore.Client()
         image_bucket = storage.Client()
-        bucket = image_bucket.get_bucket(projectName + ".appspot.com")
+        bucket = image_bucket.get_bucket(db.project + ".appspot.com")
         frequency = int(parser["APP_CONFIG"].get("FUP"))
         logging = True
     else:

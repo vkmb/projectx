@@ -6,8 +6,8 @@
 # [^∆^] ------> sync it cloud
 # [•∆•] ------> sync it local
 # [^∆^] ------> NOT DRY JUST KISS
-# Known issues:
-# Time convertion causes utc errors in smart_camera program execution
+# Solved issues:
+# utc errors in smart_camera program execution on 13/11/2019 22:57
 # ----------------------------------------------------------------
 
 import os
@@ -31,10 +31,9 @@ def sync_it_to_local():
     # then the file exists otherwise file is not found.
     if len(result) == 1:
         filePath = parser["CLOUD_CONFIG"].get("SFP")
-        projectName = parser["CLOUD_CONFIG"].get("PJN")
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(filePath)
         db = firestore.Client()
-        bucket = storage.Client().get_bucket(projectName + ".appspot.com")
+        bucket = storage.Client().get_bucket(db.project + ".appspot.com")
         facedata_collection = db.collection(parser["CLOUD_CONFIG"].get("FAD"))
         filename = "known_faces.dat"
         known_face_encodings, known_face_metadata, = [], []
@@ -102,10 +101,9 @@ def sync_it_to_cloud():
 
     if len(result) == 1:
         filePath = parser["CLOUD_CONFIG"].get("SFP")
-        projectName = parser["CLOUD_CONFIG"].get("PJN")
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(filePath)
         db = firestore.Client()
-        bucket = storage.Client().get_bucket(projectName + ".appspot.com")
+        bucket = storage.Client().get_bucket(db.project + ".appspot.com")
         facedata_collection = db.collection(parser["CLOUD_CONFIG"].get("FAD"))
         filename = "known_faces.dat"
         known_face_encodings, known_face_metadata, = [], []
