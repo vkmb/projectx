@@ -146,6 +146,7 @@ def face_recog(frame, currentTime=None):
     thread_counter += 1
 
     if thread_counter % frequency == 0:
+        thread_counter = 0
         if debug:
             print("Total threads completed :", thread_counter)
 
