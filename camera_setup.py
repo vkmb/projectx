@@ -359,8 +359,11 @@ if len(result) == 1:
                 print('No changes !!!')
             # update ip to cloud and config file
             document.set(cam_dict)
+            print('Starting smart camera')
+            os.system('python3 smart_camera.py')
         except:
             print('Cannot connect to cloud .. logging disabled')
+
 else:
     # Start wifi hotspot
     access_point = pyaccesspoint.AccessPoint(ssid='Smart Camera', password='1234567890')
