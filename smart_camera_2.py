@@ -10,26 +10,25 @@
 # [^∆^] ------> Integrate with firebase
 # [•∆•] ------> NOT DRY JUST KISS
 # ----------------------------------------------------------------
-
 import os
 import gi
 import sys
 import copy
+import time
 import pickle
 import signal
 import socket
-import imutils
-import smtplib 
 import platform
 import threading
 import numpy as np
 from cv2 import cv2
 import configparser
 import face_recognition
-from pyfcm import FCMNotification
-from sync_it_up import sync_it_to_local
 from datetime import datetime, timedelta
 from google.cloud import firestore, storage
+from google.api_core import datetime_helpers
+from sync_it_up import sync_it_to_local
+
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
@@ -37,12 +36,9 @@ from gi.repository import Gst, GstRtspServer, GLib
 
 Gst.init()
 configPath = "config.ini"
+thread_counter, accuracy = 0, 0.65
 model_options = {"Good":"hog", "Best":"cnn"}
 model_mode = "Good"
-push_service = None
-mail_service = smtplib.SMTP('smtp.gmail.com', 587) 
-mail_service.starttls()
-notification_time = datetime.now()
 
 # collection name = '$user_uid'+ config.ini[FAD]
 face_data_template = {
@@ -55,9 +51,7 @@ face_data_template = {
     "lastSeen": None,  # None === Timestamp
     "seenCount": 0,  # Number of times the person has visited totally
     "seenFrames": 0,  # Frame count
-    "userId": "",# unique id of document in collection
-    "mailOn": True,
-    "pushOn": True,
+    "userId": "",  # unique id of document in collection
 }
 
 # collection name = '$user_uid'+ config.ini[TFD]
@@ -72,8 +66,6 @@ train_data_template = {
     "seenCount": 0,  # Number of times the person has visited totally
     "seenFrames": 0,  # Frame count
     "userId": "",  # unique id of document in collection
-    "mailOn": True,
-    "pushOn": True,
 }
 
 # collection name = '$user_uid'+ config.ini[LOG]
@@ -100,29 +92,14 @@ cam_document_template = {
 # ----------------------------------------------------------------
 # Program Quit & Cleanup
 def wrap_it_up(p1, p2):
-    """
-    Function Name : 
-     - wrap_it_up
-    Description   :
-     - A callback fucntion to interrupt singal caused by key combination [ctrl + c]
-    Functionality :
-     - Saves the face metadata to the local pickle file
-     - Updates camera's lastSeen to current time 
-     - Updates camera's status to False 
-     - Stop all notification, gRPC firebase callbacks
-     - Clears all the global varibales
-     - Exits the main thread
-    """
     try:
 
         save_known_faces()
 
         global mainloop, db, bucket, facedata_collection, \
-            facedata_notifier, trainface_notifier, camera_doc, \
-            mail_service, push_service
+            facedata_notifier, trainface_notifier, camera_doc
         
-        camera_doc.update({"statusOn":False, "lastSeen": datetime.now()})
-        mail_service.quit() 
+        camera_doc.update({"statusOn":False, "lastSeen": datetime.utcnow()})
 
         facedata_notifier.unsubscribe()
         trainface_notifier.unsubscribe()
@@ -159,7 +136,7 @@ def get_jetson_gstreamer_source(
     capture_height=720,
     display_width=1280,
     display_height=720,
-    framerate=30,
+    framerate=60,
     flip_method=0,
 ):
     """
@@ -176,21 +153,21 @@ def get_jetson_gstreamer_source(
 
 
 def survillence():
-    global camera, offline, debug
+    global camera, offline
     while offline:
-        currentTime = datetime.now()
+        currentTime = datetime_helpers.utcnow()
         _, frame = camera.read()
         if _:
-            face_recog(frame, currentTime)
-            # threading.Thread(target=face_recog, args=(frame, currentTime), daemon=True).start()
-    
-sur_thread = threading.Thread(target=survillence, daemon=True)
+            threading.Thread(
+                target=face_recog, args=(frame, currentTime), daemon=True
+            ).start()
+
 
 def face_recog(frame, currentTime=None):
 
-    global debug, log_document_template, \
-            db, bucket, devId, frequency, parser, intruder_collection, \
-            model_options, model_mode, notification_time, frequency
+    global known_face_encodings, known_face_metadata, thread_counter, debug, \
+        log_document_template, db, bucket, devId, frequency, parser, intruder_collection, \
+            model_options, model_mode
 
     temp_log_document = copy.deepcopy(log_document_template)
 
@@ -208,19 +185,17 @@ def face_recog(frame, currentTime=None):
     # If so, we'll give it a label that we'll draw on top of the video.
     face_labels = []
     doc_id_path = ""
-    new_face_detected = False
-    message = ""
     for face_location, face_encoding in zip(face_locations, face_encodings):
         # See if this face is in our list of known faces.
-        metadata = lookup_known_face(face_encoding,  currentTime)
+        metadata = lookup_known_face(face_encoding)
         # If we found the face, label the face with some useful information.
         if metadata is not None:
             face_label = metadata["label"]
             doc_id_path =  "/" + parser["CLOUD_CONFIG"].get("FAD") + "/" + metadata["userId"]
+
         # If this is a brand new face, add it to our list of known faces
         else:
             face_label = "New visitor!"
-            new_face_detected = True
             # Grab the image of the the face from the current frame of video
             top, right, bottom, left = face_location
             face_image = small_frame[top:bottom, left:right]
@@ -233,13 +208,9 @@ def face_recog(frame, currentTime=None):
                 + register_new_face(face_encoding, face_image)
             )
 
-
-        
         face_labels.append(face_label)
        
         temp_log_document["peopleDetected"].append(doc_id_path)
-       
-
     # Draw a box around each face and label each face
     for (top, right, bottom, left), face_label in zip(face_locations, face_labels):
         # Scale back up face locations since the frame we detected in was scaled to 1/4 size
@@ -262,53 +233,38 @@ def face_recog(frame, currentTime=None):
             (255, 255, 255),
             1,
         )
-    if  (datetime.now() - notification_time > timedelta(minutes=frequency)):
-        if debug:
-            print('Logging - new face ', new_face_detected)
+
+    thread_counter += 1
+    if len(temp_log_document["peopleDetected"]) and frequency//2 < thread_counter < frequency:
+        thread_counter = frequency
         
+    if thread_counter % frequency == 0:
+        if debug:
+            print()
+            print("Total threads completed :", thread_counter)
+        thread_counter = 0
         if logging:
             cv2.imwrite(permFileName, frame)
             blob = bucket.blob(permFileName)
             blob.upload_from_filename(permFileName)
-            print(currentTime.strftime("%d/%m/%Y, %I:%M:%S %p"))
-            tempIntruderLogDocument = intruder_collection.document(devId + " " + currentTime.strftime("%d|%m|%Y %I:%M:%S %p"))
-            temp_log_document["timestamp"] = datetime.now()
+            
+            tempIntruderLogDocument = intruder_collection.document(devId + " " + str(currentTime))
+            temp_log_document["timestamp"] = datetime_helpers.utcnow()
             temp_log_document["imageUri"] = permFileName
             temp_log_document["location"] =  "/"+ parser["CLOUD_CONFIG"].get("CAM") + "/" + devId
             tempIntruderLogDocument.create(temp_log_document)
-
-            for people_detected in temp_log_document["peopleDetected"]:
-                key = people_detected.split("/")[-1]
-                tempDoc = facedata_collection.document(key)
-                if tempDoc.get().to_dict() is not None:
-                    for metadata in known_face_metadata:
-                        if metadata["userId"] == key:
-                            tempDoc.update(
-                                {
-                                "seenCount": metadata["seenCount"],
-                                "lastSeen": metadata["lastSeen"],
-                                # "seenFrames": known_face_metadata[tempDoc["userId"]]["seenFrames"],
-                                "firstSeenThisInteraction": metadata["firstSeenThisInteraction"],
-                                })
-                del tempDoc
-
             del temp_log_document
             del tempIntruderLogDocument
             os.remove(permFileName)
-        send_notifications()
-        notification_time = datetime.now()
-    return frame
 
+    return frame
 
 
 def register_new_face(face_encoding, face_image):
 
-    global db, bucket, facedata_collection, known_face_metadata, known_face_encodings
+    global db, bucket, facedata_collection
     document = facedata_collection.document()
-    permFileName = document.id + "_faceImage.jpg"
-    cv2.imwrite(permFileName, face_image)
-    blob = bucket.blob(permFileName)
-    blob.upload_from_filename(permFileName)
+
     """
     Add a new person to our list of known faces
     """
@@ -316,27 +272,34 @@ def register_new_face(face_encoding, face_image):
     known_face_encodings.append(face_encoding)
     # Add a matching dictionary entry to our metadata list.
     # We can use this to keep track of how many times a person has visited, when we last saw them, etc.
+
+    permFileName = document.id + "_faceImage.jpg"
+    cv2.imwrite(permFileName, face_image)
+    blob = bucket.blob(permFileName)
+    blob.upload_from_filename(permFileName)
+
     temp_facedata_document = copy.deepcopy(face_data_template)
-    temp_facedata_document["editedOn"] = datetime.now()
-    temp_facedata_document["firstSeen"] = datetime.now()
+    temp_facedata_document["editedOn"] = datetime_helpers.utcnow()
+    temp_facedata_document["firstSeen"] = datetime_helpers.utcnow()
     temp_facedata_document["faceEncoding"] = face_encoding.tostring()
-    temp_facedata_document["firstSeenThisInteraction"] = datetime.now()
+    temp_facedata_document["firstSeenThisInteraction"] = datetime_helpers.utcnow()
     temp_facedata_document["imageUri"] = permFileName
     temp_facedata_document["label"] = "Unknown"
-    temp_facedata_document["lastSeen"] = datetime.now()
+    temp_facedata_document["lastSeen"] = datetime_helpers.utcnow()
     temp_facedata_document["seenCount"] = 1
     temp_facedata_document["seenFrames"] = 1
     temp_facedata_document["userId"] = document.id
-    temp_facedata_document["mailOn"] = True
-    temp_facedata_document["pushOn"] = True
-    document.create(temp_facedata_document)
-    os.remove(permFileName)
+
     known_face_metadata.append(temp_facedata_document)
-    
-    
+    document.create(temp_facedata_document)
+
+    # os.remove(permFileName)
+
     save_known_faces()
+
     if debug:
         print("New Face added")
+
     return document.id
 
 
@@ -348,8 +311,18 @@ def save_known_faces():
 
 
 def load_known_faces():
+
     global known_face_encodings, known_face_metadata
-    sync_it_to_local()
+    try:
+        with open("known_faces.dat", "rb") as face_data_file:
+            known_face_encodings, known_face_metadata = pickle.load(face_data_file)
+            print("Known faces loaded from disk.")
+    except FileNotFoundError:
+        sync_it_to_local()
+        print(
+            "No previous face data found - starting with a blank known face list.\nTry to sync from cloud with sync_it_up module\n"
+        )
+        pass
 
 
 # def camera_meta_changed(document_snapshot, changes, read_time):
@@ -363,64 +336,49 @@ def load_known_faces():
 #             if temp_doc["mode"] != model_mode:
 #               model_mode = temp_doc["mode"]
 
-def send_notifications():
-    global known_face_metadata, debug, known_face_encodings, \
-    mail_service, push_service, parser, notification_time, frequency
-    mail_message, push_message = "", "" 
-    for temp_doc in known_face_metadata:
-        if temp_doc["mailOn"] and temp_doc["lastSeen"].replace(tzinfo=None)- datetime.now() > timedelta(minutes=frequency/frequency):
-                mail_message += "\r\n * "+ temp_doc["label"] + " last seen on " + temp_doc["lastSeen"].strftime("%d/%m/%Y, %I:%M:%S %p")+  " at " + parser["APP_CONFIG"].get("CameraName")
-        if temp_doc["pushOn"] and temp_doc["lastSeen"].replace(tzinfo=None) - datetime.now() > timedelta(seconds=frequency/frequency):
-            push_message += "\r\n * "+ temp_doc["label"] + " last seen on " + temp_doc["lastSeen"].strftime("%d/%m/%Y, %I:%M:%S %p")+  " at " + parser["APP_CONFIG"].get("CameraName")
-    
-    if len(mail_message):
-        mail_service.sendmail( parser["APP_CONFIG"].get("SMID"), parser["APP_CONFIG"].get("RMID"), "Subject: Inturder Alert \n"+mail_message)
-        if debug:
-            print("sent mail notification")
-
-    if len(push_message):
-        push_service.notify_topic_subscribers(topic_name=parser["CLOUD_CONFIG"].get("UID"), message_body="Inturder Alert \n"+push_message)
-        if debug:
-            print("sent app notification")
 
 def face_data_changed(collection_snapshot, changes, read_time):
 
-    global db, bucket, known_face_metadata, debug, known_face_encodings, \
-    mail_service, push_service, parser
-    to_be_removed_userId, temp_metadata, temp_face_encodings = [], [], []
-    if debug:
-        print("Number of known people : ", len(known_face_metadata))
-    flag = False
+    global db, bucket, known_face_metadata, debug, known_face_encodings
+
     for change in changes:
-        if change.type.name == "MODIFIED"  or change.type.name == "ADDED" :
+        if change.type.name == "MODIFIED":
             temp_doc = change.document.to_dict()
-            if temp_doc == {}:continue 
-            if change.type.name == "MODIFIED":
-                for doc in known_face_metadata:
-                    if doc["userId"] == temp_doc["userId"]:
-                        doc = temp_doc
-            elif change.type.name == "ADDED":
-                doc_id_list = [doc["userId"] for doc in known_face_metadata]
-                if change.document.id not in doc_id_list:
-                   known_face_metadata.append(temp_doc)
-                   known_face_encodings.append(np.frombuffer(temp_doc["faceEncoding"]))
+            for doc in known_face_metadata:
+                if doc["userId"] == temp_doc["userId"]:
+                    doc["label"] = temp_doc["label"]
+                    doc["editedOn"] = temp_doc["editedOn"]
+                    if debug:
+                        print(
+                            "Metadata of id {} has been updated".format(
+                                temp_doc["userId"]
+                            )
+                        )
+
+        if change.type.name == "ADDED":
+            temp_doc = change.document.to_dict()
+            doc_id_list = [doc["userId"] for doc in known_face_metadata]
+            if change.document.id in doc_id_list:
+                continue
+            if len(temp_doc.keys()) < 7:
+                continue
+            known_face_metadata.append(temp_doc)
+            known_face_encodings.append(np.frombuffer(temp_doc["faceEncoding"]))
             if debug:
-                print("{} face id updated".format(temp_doc["userId"]))
+                print("{} face id added".format(temp_doc["userId"]))
+
         if change.type.name == "REMOVED":
-            flag = True
             temp_doc = change.document.to_dict()
-            for index in known_face_metadata:
-                if (index["userId"]== temp_doc["userId"]):
-                    to_be_removed_userId.append(index['userId'])
+            for index in range(len(known_face_metadata)):
+                if (
+                    known_face_metadata[index]["faceEncoding"]
+                    == temp_doc["faceEncoding"]
+                ):
+                    known_face_metadata.pop(index)
+                    known_face_encodings.pop(index)
             if debug:
                 print("{} face id deleted".format(temp_doc["userId"]))
-    if flag:
-        for index  in known_face_metadata:
-            if index['userId'] not in to_be_removed_userId:
-                temp_metadata.append(index)
-                temp_face_encodings.append(index['faceEncoding'])
-        known_face_metadata, known_face_encodings = copy.deepcopy(temp_metadata), copy.deepcopy(temp_face_encodings)
-    del temp_metadata, temp_face_encodings
+
     save_known_faces()
 
 
@@ -455,18 +413,16 @@ def new_face_added(collection_snapshot, changes, read_time):
                 if len(face_locations) is 1 and len(face_encodings) is 1:
                     error = "Dict creation "
                     facedata_document_template = {
-                        "editedOn": datetime.now(),
+                        "editedOn": datetime_helpers.utcnow(),
                         "faceEncoding": face_encodings[0].tostring(),
-                        "firstSeen": datetime.now(),
-                        "firstSeenThisInteraction": datetime.now(),
+                        "firstSeen": datetime_helpers.utcnow(),
+                        "firstSeenThisInteraction": datetime_helpers.utcnow(),
                         "imageUri": temp_doc["imageUri"],
                         "label": temp_doc["label"],
-                        "lastSeen": datetime.now(),
+                        "lastSeen": datetime_helpers.utcnow(),
                         "seenCount": 0,
                         "seenFrames": 0,
                         "userId": change.document.id,
-                        "mailOn": True,
-                        "pushOn": True,
                     }
                     error = "Document exsists : Cloud document creation "
                     facedata_collection.add(
@@ -490,52 +446,58 @@ def new_face_added(collection_snapshot, changes, read_time):
 
     print("Last updated at {}\n".format(read_time))
 
-def lookup_known_face(face_encoding,  currentTime):
-    global facedata_collection, known_face_encodings, known_face_metadata
+
+def lookup_known_face(face_encoding):
+    global facedata_collection, accuracy
     """
     See if this is a face we already have in our face list
     """
     metadata = None
-    try:
 
     # If our known face list is empty, just return nothing since we can't possibly have seen this face.
-        if len(known_face_encodings) == 0:
-            return metadata
+    if len(known_face_encodings) == 0:
+        return metadata
 
-        # Calculate the face distance between the unknown face and every face on in our known face list
-        # This will return a floating point number between 0.0 and 1.0 for each known face. The smaller the number,
-        # the more similar that face was to the unknown face.
-        face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+    # Calculate the face distance between the unknown face and every face on in our known face list
+    # This will return a floating point number between 0.0 and 1.0 for each known face. The smaller the number,
+    # the more similar that face was to the unknown face.
+    face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
 
-        # Get the known face that had the lowest distance (i.e. most similar) from the unknown face.
-        best_match_index = np.argmin(face_distances)
-        if debug:
-            print("best match index : ",best_match_index)
-            print(face_distances)
-        # If the face with the lowest distance had a distance under 0.6, we consider it a face match.
-        # 0.6 comes from how the face recognition model was trained. It was trained to make sure pictures
-        # of the same person always were less than 0.6 away from each other.
-        # Here, we are loosening the threshold a little bit to 0.65 because it is unlikely that two very similar
-        # people will come up to the door at the same time.
-        # if best_match_index < len(face_distances):
-    
-        if face_distances[best_match_index] < 0.65 :
-            # If we have a match, look up the metadata we've saved for it (like the first time we saw it, etc)
-            metadata = known_face_metadata[best_match_index]
-           
-            # Update the metadata for the face so we can keep track of how recently we have seen this face.
-            
-            metadata["firstSeenThisInteraction"] = datetime.now().replace(tzinfo=None)
-            metadata["lastSeen"] = datetime.now().replace(tzinfo=None)
+    # Get the known face that had the lowest distance (i.e. most similar) from the unknown face.
+    best_match_index = np.argmin(face_distances)
+
+    # If the face with the lowest distance had a distance under 0.6, we consider it a face match.
+    # 0.6 comes from how the face recognition model was trained. It was trained to make sure pictures
+    # of the same person always were less than 0.6 away from each other.
+    # Here, we are loosening the threshold a little bit to 0.65 because it is unlikely that two very similar
+    # people will come up to the door at the same time.
+    if face_distances[best_match_index] < accuracy:
+        # If we have a match, look up the metadata we've saved for it (like the first time we saw it, etc)
+        metadata = known_face_metadata[best_match_index]
+
+        # Update the metadata for the face so we can keep track of how recently we have seen this face.
+        metadata["lastSeen"] = datetime_helpers.utcnow()
+        metadata["seenCount"] += 1
+
+        # We'll also keep a total "seen count" that tracks how many times this person has come to the door.
+        # But we can say that if we have seen this person within the last 5 minutes, it is still the same
+        # visit, not a new visit. But if they go away for awhile and come back, that is a new visit.
+        if datetime_helpers.utcnow() - metadata["firstSeenThisInteraction"].replace(
+            tzinfo=None
+        ) > timedelta(minutes=2):
+            metadata["firstSeenThisInteraction"] = datetime_helpers.utcnow()
             metadata["seenCount"] += 1
 
-            # We'll also keep a total "seen count" that tracks how many times this person has come to the door.
-            # But we can say that if we have seen this person within the last 5 minutes, it is still the same
-            # visit, not a new visit. But if they go away for awhile and come back, that is a new visit.
-            
-
-    except:
-        pass
+            tempDoc = facedata_collection.document(metadata["userId"])
+            tempDoc.update(
+                {
+                    "seenCount": metadata["seenCount"],
+                    "lastSeen": metadata["lastSeen"],
+                    "seenFrames": metadata["seenFrames"],
+                    "firstSeenThisInteraction": metadata["firstSeenThisInteraction"],
+                }
+            )
+            del tempDoc
 
     return metadata
 
@@ -565,13 +527,13 @@ class SensorFactory(GstRtspServer.RTSPMediaFactory):
   Gstreamer Pipeline to stream data from camera with face recogniition via rtsp & udp
   """
     # ------------------------------------------------------------------------------------#
-    global camera, debug, sur_thread
+    global camera, debug
 
     def __init__(self, **properties):
         super(SensorFactory, self).__init__(**properties)
         self.cap = camera
         self.number_frames = 0
-        self.fps = 30
+        self.fps = 15
         self.duration = 1 / self.fps * Gst.SECOND  # duration of a frame in nanoseconds
         self.launch_string = (
             "appsrc name=source is-live=true block=true format=GST_FORMAT_TIME "
@@ -580,32 +542,27 @@ class SensorFactory(GstRtspServer.RTSPMediaFactory):
             "! x264enc speed-preset=ultrafast tune=zerolatency "
             "! rtph264pay config-interval=1 name=pay0 pt=96".format(self.fps)
         )
-        if sur_thread.is_alive():
-            sur_thread.exit()
 
     def on_need_data(self, src, lenght):
         global offline
-        currentTime = datetime.now()
-        _, frame = self.cap.read()
-        if _:
-            if self.number_frames % self.fps == 0:
+        if self.cap.isOpened():
+            currentTime = datetime_helpers.utcnow()
+            ret, frame = self.cap.read()
+            if ret:
+                # Resize frame of video to 1/4 size for faster face recognition processing
                 frame = face_recog(frame, currentTime)
-                if debug:
-                        print("face recog")
-            data = frame.tostring()
-            buf = Gst.Buffer.new_allocate(None, len(data), None)
-            buf.fill(0, data)
-            buf.duration = self.duration
-            timestamp = self.number_frames * self.duration
-            buf.pts = buf.dts = int(timestamp)
-            buf.offset = timestamp
-            self.number_frames += 1
-
-            retval = src.emit("push-buffer", buf)
-            if retval != Gst.FlowReturn.OK and retval == Gst.FlowReturn.FLUSHING:
-                offline = True
-                sur_thread = threading.Thread(target=survillence)
-                if not sur_thread.is_alive():
+                data = frame.tostring()
+                buf = Gst.Buffer.new_allocate(None, len(data), None)
+                buf.fill(0, data)
+                buf.duration = self.duration
+                timestamp = self.number_frames * self.duration
+                buf.pts = buf.dts = int(timestamp)
+                buf.offset = timestamp
+                self.number_frames += 1
+                retval = src.emit("push-buffer", buf)
+                if retval != Gst.FlowReturn.OK and retval == Gst.FlowReturn.FLUSHING:
+                    offline = True
+                    sur_thread = threading.Thread(target=survillence)
                     sur_thread.start()
                     if debug:
                         print("Going offline, streaming stopped")
@@ -656,6 +613,7 @@ class GstServer(GstRtspServer.RTSPServer):
 if __name__ == "__main__":
     try:
         debug = True if (sys.argv[-1].split("="))[-1].lower() == "true" else False
+        thread_counter = 0
     except:
         pass
 
@@ -682,7 +640,7 @@ if __name__ == "__main__":
         camera = cv2.VideoCapture(get_jetson_gstreamer_source(), cv2.CAP_GSTREAMER)
 
     else:
-        camera = cv2.VideoCapture(1)
+        camera = cv2.VideoCapture(0)
 
     if debug:
         if camera is not None:
@@ -696,9 +654,7 @@ if __name__ == "__main__":
     known_face_encodings = []
     known_face_metadata = []
     load_known_faces()
-    # s.starttls() 
-    mail_service.login(parser["APP_CONFIG"].get("SMID"), parser["APP_CONFIG"].get("SMPK"))
-    push_service = FCMNotification(api_key=parser["APP_CONFIG"].get("MSAK"))  
+
     facedata_collection = db.collection(parser["CLOUD_CONFIG"].get("FAD"))
     trainface_collection = db.collection(parser["CLOUD_CONFIG"].get("TFD"))
     intruder_collection = db.collection(parser["CLOUD_CONFIG"].get("LOG"))
@@ -717,7 +673,7 @@ if __name__ == "__main__":
 
     offline = True
 
-    
+    sur_thread = threading.Thread(target=survillence, daemon=True)
     sur_thread.start()
 
     if debug:

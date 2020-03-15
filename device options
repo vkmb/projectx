@@ -1,0 +1,35 @@
+accuracy = range(0.0, 1.0)
+options 
+face_locations(img, number_of_times_to_upsample=1, model='hog')
+    Returns an array of bounding boxes of human faces in a image
+    
+    :param img: An image (as a numpy array)
+    :param number_of_times_to_upsample: How many times to upsample the image looking for faces. Higher numbers find smaller faces.
+    :param model: Which face detection model to use. "hog" is less accurate but faster on CPUs. "cnn" is a more accurate
+                  deep-learning model which is GPU/CUDA accelerated (if available). The default is "hog".
+    :return: A list of tuples of found face locations in css (top, right, bottom, left) order
+
+
+face_encodings(face_image, known_face_locations=None, num_jitters=1)
+    Given an image, return the 128-dimension face encoding for each face in the image.
+    
+    :param face_image: The image that contains one or more faces
+    :param known_face_locations: Optional - the bounding boxes of each face if you already know them.
+    :param num_jitters: How many times to re-sample the face when calculating encoding. Higher is more accurate, but slower (i.e. 100 is 100x slower)
+    :return: A list of 128-dimensional face encodings (one for each face in the image)
+
+face_distance(face_encodings, face_to_compare)
+    Given a list of face encodings, compare them to a known face encoding and get a euclidean distance
+    for each comparison face. The distance tells you how similar the faces are.
+    
+    :param faces: List of face encodings to compare
+    :param face_to_compare: A face encoding to compare against
+    :return: A numpy ndarray with the distance for each face in the same order as the 'faces' array
+
+
+mode = "cnn" || "hog"[default]
+number_of_times_to_upsample =  1 (higher number more accuracy)
+face_encodings
+num_jitters = 1
+
+to be shipped with the device config.json, cloud message server key

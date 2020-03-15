@@ -12,12 +12,28 @@
 
 import os
 import sys
-import cv2
+from cv2 import cv2
+import copy
 import pickle
 import numpy as np
 import configparser
 from google.cloud import firestore, storage
 from google.api_core import datetime_helpers
+
+
+# collection name = '$user_uid'+ config.ini[FAD]
+face_data_template = {
+    "editedOn": None,  # None === Timestamp
+    "faceEncoding": None,  # blob
+    "firstSeen": None,  # None === Timestamp
+    "firstSeenThisInteraction": None,  # None === Timestamp
+    "imageUri": "",  # firebase storage url
+    "label": "",  # User set name
+    "lastSeen": None,  # None === Timestamp
+    "seenCount": 0,  # Number of times the person has visited totally
+    "seenFrames": 0,  # Frame count
+    "userId": "",  # unique id of document in collection
+}
 
 
 def sync_it_to_local():
@@ -45,38 +61,23 @@ def sync_it_to_local():
         except FileNotFoundError as e:
             pass
 
-        exsistingUUIDs = [doc["uuid"] for doc in known_face_metadata]
+        exsistinguserIds = [doc["userId"] for doc in known_face_metadata]
         count = 0
 
         for doc in facedata_collection.stream():
             tmpdoc = doc.to_dict()
-            if doc.id in exsistingUUIDs:
+            if doc.id in exsistinguserIds or tmpdoc == {}:
                 continue
             else:
-                if len(tmpdoc["FaceEncodingString"]) != 0:
-                    face_image_blob = bucket.blob(doc.id + "_faceImage.jpg")
+                if "faceEncoding" in tmpdoc.keys() and len(tmpdoc["faceEncoding"]) != 0:
+                    face_image_blob = bucket.blob(tmpdoc["imageUri"])
                     face_image_blob.download_to_filename(
                         filename=doc.id + "_faceImage.jpg"
                     )
                     image = cv2.imread(doc.id + "_faceImage.jpg")
-                    known_face_encodings.append(
-                        np.frombuffer(tmpdoc["FaceEncodingString"])
-                    )
-                    known_face_metadata.append(
-                        {
-                            "first_seen": tmpdoc["FirstSeen"],
-                            "last_seen": tmpdoc["LastSeen"],
-                            "first_seen_this_interaction": tmpdoc[
-                                "FirstSeenThisInteraction"
-                            ],
-                            "seen_count": tmpdoc["SeenCount"],
-                            "seen_frames": tmpdoc["SeenFrames"],
-                            "face_image": image,
-                            "name": tmpdoc["UserSetLabels"][0],
-                            "uuid": doc.id,
-                        }
-                    )
-                    os.remove(doc.id + "_faceImage.jpg")
+                    known_face_encodings.append(np.frombuffer(tmpdoc["faceEncoding"]))
+                    known_face_metadata.append(tmpdoc)
+                    # os.remove(doc.id + "_faceImage.jpg")
                     count += 1
 
         with open("known_faces.dat", "wb") as face_data_file:
@@ -86,7 +87,6 @@ def sync_it_to_local():
             # known_face_metadata
     else:
         raise FileNotFoundError
-        exit(-1)
 
 
 def sync_it_to_cloud():
@@ -100,14 +100,13 @@ def sync_it_to_cloud():
     # then the file exists otherwise file is not found.
 
     if len(result) == 1:
+        filename = "known_faces.dat"
         filePath = parser["CLOUD_CONFIG"].get("SFP")
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(filePath)
         db = firestore.Client()
         bucket = storage.Client().get_bucket(db.project + ".appspot.com")
         facedata_collection = db.collection(parser["CLOUD_CONFIG"].get("FAD"))
-        filename = "known_faces.dat"
         known_face_encodings, known_face_metadata, = [], []
-
         try:
             with open("known_faces.dat", "rb") as face_data_file:
                 known_face_encodings, known_face_metadata = pickle.load(face_data_file)
@@ -115,43 +114,23 @@ def sync_it_to_cloud():
         except FileNotFoundError as e:
             print("No local data found to be upload")
             exit(-1)
-
-        exsistingUUIDs = [doc["uuid"] for doc in known_face_metadata]
-
-        print("Found {} faces to be uploaded".format(len(exsistingUUIDs)))
-
+        exsistinguserIds = [doc["userId"] for doc in known_face_metadata]
+        print("Found {} faces to be uploaded".format(len(exsistinguserIds)))
         for docIndex in range(0, len(known_face_encodings)):
-
             document = facedata_collection.document(
-                known_face_metadata[docIndex]["uuid"]
+                known_face_metadata[docIndex]["userId"]
             )
+            if ".jpg" in known_face_metadata[docIndex]["imageUri"]:
+                permFileName = known_face_metadata[docIndex]["imageUri"] 
+            else:
+                permFileName = known_face_metadata[docIndex]["imageUri"] + ".jpg"
 
-            permFileName = known_face_metadata[docIndex]["uuid"] + "_faceImage.jpg"
-            cv2.imwrite(permFileName, known_face_metadata[docIndex]["face_image"])
+            known_face_metadata[docIndex]["imageUri"] = permFileName
             blob = bucket.blob(permFileName)
             blob.upload_from_filename(permFileName)
-
-            facedata_document_template = {
-                "FaceEncodingString": known_face_encodings[docIndex].tostring(),
-                "FirstSeen": known_face_metadata[docIndex]["first_seen"],
-                "ImageURI": blob2.media_link,
-                "FirstSeenThisInteraction": known_face_metadata[docIndex][
-                    "first_seen_this_interaction"
-                ],
-                "LastSeen": known_face_metadata[docIndex]["last_seen"],
-                "UserSetLabels": [known_face_metadata[docIndex]["name"]],
-                "SeenCount": known_face_metadata[docIndex]["seen_count"],
-                "SeenFrames": known_face_metadata[docIndex]["seen_frames"],
-            }
-
-            document.create(facedata_document_template)
-
-            os.remove(permFileName1)
-            os.remove(permFileName2)
-
+            document.set(known_face_metadata[docIndex])
     else:
         raise FileNotFoundError
-        exit(-1)
 
 
 if __name__ == "__main__":
