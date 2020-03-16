@@ -12,7 +12,7 @@
 
 import os
 import sys
-from cv2 import cv2
+import cv2
 import copy
 import pickle
 import numpy as np
@@ -121,7 +121,7 @@ def sync_it_to_cloud():
                 known_face_metadata[docIndex]["userId"]
             )
             if ".jpg" in known_face_metadata[docIndex]["imageUri"]:
-                permFileName = known_face_metadata[docIndex]["imageUri"] 
+                permFileName = known_face_metadata[docIndex]["imageUri"]
             else:
                 permFileName = known_face_metadata[docIndex]["imageUri"] + ".jpg"
 

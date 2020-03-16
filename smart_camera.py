@@ -13,17 +13,17 @@
 
 import os
 import gi
+import cv2
 import sys
 import copy
 import pickle
 import signal
 import socket
 import imutils
-import smtplib 
+import smtplib
 import platform
 import threading
 import numpy as np
-from cv2 import cv2
 import configparser
 import face_recognition
 from pyfcm import FCMNotification
@@ -37,10 +37,10 @@ from gi.repository import Gst, GstRtspServer, GLib
 
 Gst.init()
 configPath = "config.ini"
-model_options = {"Good":"hog", "Best":"cnn"}
+model_options = {"Good": "hog", "Best": "cnn"}
 model_mode = "Good"
 push_service = None
-mail_service = smtplib.SMTP('smtp.gmail.com', 587) 
+mail_service = smtplib.SMTP("smtp.gmail.com", 587)
 mail_service.starttls()
 notification_time = datetime.now()
 
@@ -55,7 +55,7 @@ face_data_template = {
     "lastSeen": None,  # None === Timestamp
     "seenCount": 0,  # Number of times the person has visited totally
     "seenFrames": 0,  # Frame count
-    "userId": "",# unique id of document in collection
+    "userId": "",  # unique id of document in collection
     "mailOn": True,
     "pushOn": True,
 }
@@ -93,7 +93,7 @@ cam_document_template = {
     "lastSeen": None,
     "statusOn": False,
     "uid": "",
-    "mode" : "good"
+    "mode": "good",
 }
 
 
@@ -101,10 +101,13 @@ cam_document_template = {
 # Program Quit & Cleanup
 def wrap_it_up(p1, p2):
     """
-    Function Name : 
-     - wrap_it_up
+    Function Usage : 
+     - signal.signal(signal.SIGINT, wrap_it_up)
     Description   :
      - A callback fucntion to interrupt singal caused by key combination [ctrl + c]
+    Parameters    :
+     - @p1 : signal number  
+     - @p2 : interrupted stack frame
     Functionality :
      - Saves the face metadata to the local pickle file
      - Updates camera's lastSeen to current time 
@@ -117,22 +120,22 @@ def wrap_it_up(p1, p2):
 
         save_known_faces()
 
-        global mainloop, db, bucket, facedata_collection, \
-            facedata_notifier, trainface_notifier, camera_doc, \
-            mail_service, push_service
-        
-        camera_doc.update({"statusOn":False, "lastSeen": datetime.now()})
-        mail_service.quit() 
+        global mainloop, db, bucket, facedata_collection, facedata_notifier, trainface_notifier, camera_doc, mail_service, push_service, camera_notifier, camera
+
+        camera_doc.update({"statusOn": False, "lastSeen": datetime.now()})
+        mail_service.quit()
 
         facedata_notifier.unsubscribe()
         trainface_notifier.unsubscribe()
-        
+        camera_notifier.unsubscribe()
+        camera.release()
+
         del db
         del bucket
         del facedata_collection
         del facedata_notifier
         del trainface_notifier
-        
+
         mainloop.quit()
     except:
         # mainloop was not created
@@ -148,10 +151,23 @@ signal.signal(signal.SIGINT, wrap_it_up)
 
 
 def running_on_jetson_nano():
-    # To make the same code work on a laptop or on a Jetson Nano, we'll detect when we are running on the Nano
-    # so that we can access the camera correctly in that case.
-    # On a normal Intel laptop, platform.machine() will be "x86_64" instead of "aarch64"
+    """
+    Function Usage : 
+     - running_on_jetson_nano()
+    Parameters     :
+     - Nil
+    Funcationality :
+     - Retruns a boolean value based on the architecture
+    """
     return platform.machine() == "aarch64"
+
+
+def get_current_ip():
+    portal = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    portal.connect(("8.8.8.8", 80))
+    current_ip = portal.getsockname()[0]
+    portal.close()
+    return current_ip
 
 
 def get_jetson_gstreamer_source(
@@ -163,8 +179,19 @@ def get_jetson_gstreamer_source(
     flip_method=0,
 ):
     """
-    Return an OpenCV-compatible video source description that uses gstreamer to capture video from the camera on a Jetson Nano
+    Function Usage : 
+     - get_jetson_gstreamer_source(capture_width, capture_height, display_width, display_height, framerate, flip_method)
+    Parameters     :
+     - @capture_width  - int - width of the captured image
+     - @capture_height - int - height of the captured image
+     - @display_width  - int - width of the captured image
+     - @display_height - int - width of the captured image
+     - @framerate      - int - frames per second 
+     - @flip_method    - int - flip the captured image  - 0, 90, 180, 270 
+    Funcationality :
+     - Retruns a OpenCV-compatible gstreamer pipeline specific to jetson nano for PiCam v2.1
     """
+
     return (
         f"nvarguscamerasrc ! video/x-raw(memory:NVMM), "
         + f"width=(int){capture_width}, height=(int){capture_height}, "
@@ -183,14 +210,14 @@ def survillence():
         if _:
             face_recog(frame, currentTime)
             # threading.Thread(target=face_recog, args=(frame, currentTime), daemon=True).start()
-    
+
+
 sur_thread = threading.Thread(target=survillence, daemon=True)
+
 
 def face_recog(frame, currentTime=None):
 
-    global debug, log_document_template, \
-            db, bucket, devId, frequency, parser, intruder_collection, \
-            model_options, model_mode, notification_time, frequency
+    global debug, log_document_template, db, bucket, devId, frequency, parser, intruder_collection, model_options, model_mode, notification_time, frequency
 
     temp_log_document = copy.deepcopy(log_document_template)
 
@@ -202,7 +229,9 @@ def face_recog(frame, currentTime=None):
     # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
     rgb_small_frame = small_frame[:, :, ::-1]
     # Find all the face locations and face encodings in the current frame of video
-    face_locations = face_recognition.face_locations(rgb_small_frame,  model=model_options[model_mode])
+    face_locations = face_recognition.face_locations(
+        rgb_small_frame, model=model_options[model_mode]
+    )
     face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
     # Loop through each detected face and see if it is one we have seen before
     # If so, we'll give it a label that we'll draw on top of the video.
@@ -212,11 +241,13 @@ def face_recog(frame, currentTime=None):
     message = ""
     for face_location, face_encoding in zip(face_locations, face_encodings):
         # See if this face is in our list of known faces.
-        metadata = lookup_known_face(face_encoding,  currentTime)
+        metadata = lookup_known_face(face_encoding, currentTime)
         # If we found the face, label the face with some useful information.
         if metadata is not None:
             face_label = metadata["label"]
-            doc_id_path =  "/" + parser["CLOUD_CONFIG"].get("FAD") + "/" + metadata["userId"]
+            doc_id_path = (
+                "/" + parser["CLOUD_CONFIG"].get("FAD") + "/" + metadata["userId"]
+            )
         # If this is a brand new face, add it to our list of known faces
         else:
             face_label = "New visitor!"
@@ -233,12 +264,9 @@ def face_recog(frame, currentTime=None):
                 + register_new_face(face_encoding, face_image)
             )
 
-
-        
         face_labels.append(face_label)
-       
+
         temp_log_document["peopleDetected"].append(doc_id_path)
-       
 
     # Draw a box around each face and label each face
     for (top, right, bottom, left), face_label in zip(face_locations, face_labels):
@@ -262,19 +290,23 @@ def face_recog(frame, currentTime=None):
             (255, 255, 255),
             1,
         )
-    if  (datetime.now() - notification_time > timedelta(minutes=frequency)):
+    if datetime.now() - notification_time > timedelta(minutes=frequency):
         if debug:
-            print('Logging - new face ', new_face_detected)
-        
+            print("Logging - new face ", new_face_detected)
+
         if logging:
             cv2.imwrite(permFileName, frame)
             blob = bucket.blob(permFileName)
             blob.upload_from_filename(permFileName)
             print(currentTime.strftime("%d/%m/%Y, %I:%M:%S %p"))
-            tempIntruderLogDocument = intruder_collection.document(devId + " " + currentTime.strftime("%d|%m|%Y %I:%M:%S %p"))
+            tempIntruderLogDocument = intruder_collection.document(
+                devId + " " + currentTime.strftime("%d-%m-%Y %I:%M:%S %p")
+            )
             temp_log_document["timestamp"] = datetime.now()
             temp_log_document["imageUri"] = permFileName
-            temp_log_document["location"] =  "/"+ parser["CLOUD_CONFIG"].get("CAM") + "/" + devId
+            temp_log_document["location"] = (
+                "/" + parser["CLOUD_CONFIG"].get("CAM") + "/" + devId
+            )
             tempIntruderLogDocument.create(temp_log_document)
 
             for people_detected in temp_log_document["peopleDetected"]:
@@ -285,11 +317,14 @@ def face_recog(frame, currentTime=None):
                         if metadata["userId"] == key:
                             tempDoc.update(
                                 {
-                                "seenCount": metadata["seenCount"],
-                                "lastSeen": metadata["lastSeen"],
-                                # "seenFrames": known_face_metadata[tempDoc["userId"]]["seenFrames"],
-                                "firstSeenThisInteraction": metadata["firstSeenThisInteraction"],
-                                })
+                                    "seenCount": metadata["seenCount"],
+                                    "lastSeen": metadata["lastSeen"],
+                                    # "seenFrames": known_face_metadata[tempDoc["userId"]]["seenFrames"],
+                                    "firstSeenThisInteraction": metadata[
+                                        "firstSeenThisInteraction"
+                                    ],
+                                }
+                            )
                 del tempDoc
 
             del temp_log_document
@@ -298,7 +333,6 @@ def face_recog(frame, currentTime=None):
         send_notifications()
         notification_time = datetime.now()
     return frame
-
 
 
 def register_new_face(face_encoding, face_image):
@@ -332,8 +366,7 @@ def register_new_face(face_encoding, face_image):
     document.create(temp_facedata_document)
     os.remove(permFileName)
     known_face_metadata.append(temp_facedata_document)
-    
-    
+
     save_known_faces()
     if debug:
         print("New Face added")
@@ -352,49 +385,76 @@ def load_known_faces():
     sync_it_to_local()
 
 
-# def camera_meta_changed(document_snapshot, changes, read_time):
-#     global camera_doc, model_mode, model_options
-#     for change in changes:
-#         if change.type.name == "MODIFIED":
-#             temp_doc = change.document.to_dict()
-#             ip = socket.gethostbyname(socket.gethostname())
-#             if not temp_doc["url"].contains(ip):
-#                 camera_doc.update({"url":"rtsp://"+ip+":8554/video"})
-#             if temp_doc["mode"] != model_mode:
-#               model_mode = temp_doc["mode"]
+def camera_meta_changed(document_snapshot, changes, read_time):
+    global camera_doc, model_mode, model_options
+    for change in changes:
+        if change.type.name == "MODIFIED":
+            temp_doc = change.document.to_dict()
+            ip = socket.gethostbyname(socket.gethostname())
+            if not temp_doc["url"].contains(ip):
+                camera_doc.update({"url": "rtsp://" + ip + ":8554/video"})
+            if temp_doc["mode"] != model_mode:
+                model_mode = temp_doc["mode"]
+
 
 def send_notifications():
-    global known_face_metadata, debug, known_face_encodings, \
-    mail_service, push_service, parser, notification_time, frequency
-    mail_message, push_message = "", "" 
+    global known_face_metadata, debug, known_face_encodings, mail_service, push_service, parser, notification_time, frequency
+    mail_message, push_message = "", ""
     for temp_doc in known_face_metadata:
-        if temp_doc["mailOn"] and temp_doc["lastSeen"].replace(tzinfo=None)- datetime.now() > timedelta(minutes=frequency/frequency):
-                mail_message += "\r\n * "+ temp_doc["label"] + " last seen on " + temp_doc["lastSeen"].strftime("%d/%m/%Y, %I:%M:%S %p")+  " at " + parser["APP_CONFIG"].get("CameraName")
-        if temp_doc["pushOn"] and temp_doc["lastSeen"].replace(tzinfo=None) - datetime.now() > timedelta(seconds=frequency/frequency):
-            push_message += "\r\n * "+ temp_doc["label"] + " last seen on " + temp_doc["lastSeen"].strftime("%d/%m/%Y, %I:%M:%S %p")+  " at " + parser["APP_CONFIG"].get("CameraName")
-    
+        time_interval = datetime.now() - temp_doc["lastSeen"].replace(tzinfo=None)
+        if temp_doc["mailOn"] and timedelta(
+            minutes=frequency / frequency
+        ) < time_interval < timedelta(minutes=10):
+            mail_message += (
+                "\r\n * "
+                + temp_doc["label"]
+                + " last seen on "
+                + temp_doc["lastSeen"].strftime("%d/%m/%Y, %I:%M:%S %p")
+                + " at "
+                + parser["APP_CONFIG"].get("CameraName")
+            )
+        if temp_doc["pushOn"] and timedelta(
+            minutes=frequency / frequency
+        ) < time_interval < timedelta(minutes=10):
+            push_message += (
+                "\r\n * "
+                + temp_doc["label"]
+                + " last seen on "
+                + temp_doc["lastSeen"].strftime("%d/%m/%Y, %I:%M:%S %p")
+                + " at "
+                + parser["APP_CONFIG"].get("CameraName")
+            )
+
     if len(mail_message):
-        mail_service.sendmail( parser["APP_CONFIG"].get("SMID"), parser["APP_CONFIG"].get("RMID"), "Subject: Inturder Alert \n"+mail_message)
+        mail_service.sendmail(
+            parser["APP_CONFIG"].get("SMID"),
+            parser["APP_CONFIG"].get("RMID"),
+            "Subject: Inturder Alert \n" + mail_message,
+        )
         if debug:
             print("sent mail notification")
 
     if len(push_message):
-        push_service.notify_topic_subscribers(topic_name=parser["CLOUD_CONFIG"].get("UID"), message_body="Inturder Alert \n"+push_message)
+        push_service.notify_topic_subscribers(
+            topic_name=parser["CLOUD_CONFIG"].get("UID"),
+            message_body="Inturder Alert \n" + push_message,
+        )
         if debug:
             print("sent app notification")
 
+
 def face_data_changed(collection_snapshot, changes, read_time):
 
-    global db, bucket, known_face_metadata, debug, known_face_encodings, \
-    mail_service, push_service, parser
+    global db, bucket, known_face_metadata, debug, known_face_encodings, mail_service, push_service, parser
     to_be_removed_userId, temp_metadata, temp_face_encodings = [], [], []
     if debug:
         print("Number of known people : ", len(known_face_metadata))
     flag = False
     for change in changes:
-        if change.type.name == "MODIFIED"  or change.type.name == "ADDED" :
+        if change.type.name == "MODIFIED" or change.type.name == "ADDED":
             temp_doc = change.document.to_dict()
-            if temp_doc == {}:continue 
+            if temp_doc == {}:
+                continue
             if change.type.name == "MODIFIED":
                 for doc in known_face_metadata:
                     if doc["userId"] == temp_doc["userId"]:
@@ -402,31 +462,33 @@ def face_data_changed(collection_snapshot, changes, read_time):
             elif change.type.name == "ADDED":
                 doc_id_list = [doc["userId"] for doc in known_face_metadata]
                 if change.document.id not in doc_id_list:
-                   known_face_metadata.append(temp_doc)
-                   known_face_encodings.append(np.frombuffer(temp_doc["faceEncoding"]))
+                    known_face_metadata.append(temp_doc)
+                    known_face_encodings.append(np.frombuffer(temp_doc["faceEncoding"]))
             if debug:
                 print("{} face id updated".format(temp_doc["userId"]))
         if change.type.name == "REMOVED":
             flag = True
             temp_doc = change.document.to_dict()
             for index in known_face_metadata:
-                if (index["userId"]== temp_doc["userId"]):
-                    to_be_removed_userId.append(index['userId'])
+                if index["userId"] == temp_doc["userId"]:
+                    to_be_removed_userId.append(index["userId"])
             if debug:
                 print("{} face id deleted".format(temp_doc["userId"]))
     if flag:
-        for index  in known_face_metadata:
-            if index['userId'] not in to_be_removed_userId:
+        for index in known_face_metadata:
+            if index["userId"] not in to_be_removed_userId:
                 temp_metadata.append(index)
-                temp_face_encodings.append(index['faceEncoding'])
-        known_face_metadata, known_face_encodings = copy.deepcopy(temp_metadata), copy.deepcopy(temp_face_encodings)
+                temp_face_encodings.append(index["faceEncoding"])
+        known_face_metadata, known_face_encodings = (
+            copy.deepcopy(temp_metadata),
+            copy.deepcopy(temp_face_encodings),
+        )
     del temp_metadata, temp_face_encodings
     save_known_faces()
 
 
 def new_face_added(collection_snapshot, changes, read_time):
-    global bucket, facedata_collection, trainface_collection, trainface_notifier, debug, \
-        model_options, model_mode
+    global bucket, facedata_collection, trainface_collection, trainface_notifier, debug, model_options, model_mode
     for change in changes:
         if change.type.name == "ADDED":
             error = "unknown"
@@ -447,7 +509,9 @@ def new_face_added(collection_snapshot, changes, read_time):
                 frame = cv2.imread(temp_file_name)
                 # cv2 specifics
                 rgb_small_frame = frame[:, :, ::-1]
-                face_locations = face_recognition.face_locations(rgb_small_frame, model=model_options[model_mode])
+                face_locations = face_recognition.face_locations(
+                    rgb_small_frame, model=model_options[model_mode]
+                )
                 face_encodings = face_recognition.face_encodings(
                     rgb_small_frame, face_locations
                 )
@@ -490,7 +554,8 @@ def new_face_added(collection_snapshot, changes, read_time):
 
     print("Last updated at {}\n".format(read_time))
 
-def lookup_known_face(face_encoding,  currentTime):
+
+def lookup_known_face(face_encoding, currentTime):
     global facedata_collection, known_face_encodings, known_face_metadata
     """
     See if this is a face we already have in our face list
@@ -498,19 +563,21 @@ def lookup_known_face(face_encoding,  currentTime):
     metadata = None
     try:
 
-    # If our known face list is empty, just return nothing since we can't possibly have seen this face.
+        # If our known face list is empty, just return nothing since we can't possibly have seen this face.
         if len(known_face_encodings) == 0:
             return metadata
 
         # Calculate the face distance between the unknown face and every face on in our known face list
         # This will return a floating point number between 0.0 and 1.0 for each known face. The smaller the number,
         # the more similar that face was to the unknown face.
-        face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+        face_distances = face_recognition.face_distance(
+            known_face_encodings, face_encoding
+        )
 
         # Get the known face that had the lowest distance (i.e. most similar) from the unknown face.
         best_match_index = np.argmin(face_distances)
         if debug:
-            print("best match index : ",best_match_index)
+            print("best match index : ", best_match_index)
             print(face_distances)
         # If the face with the lowest distance had a distance under 0.6, we consider it a face match.
         # 0.6 comes from how the face recognition model was trained. It was trained to make sure pictures
@@ -518,13 +585,13 @@ def lookup_known_face(face_encoding,  currentTime):
         # Here, we are loosening the threshold a little bit to 0.65 because it is unlikely that two very similar
         # people will come up to the door at the same time.
         # if best_match_index < len(face_distances):
-    
-        if face_distances[best_match_index] < 0.65 :
+
+        if face_distances[best_match_index] < 0.65:
             # If we have a match, look up the metadata we've saved for it (like the first time we saw it, etc)
             metadata = known_face_metadata[best_match_index]
-           
+
             # Update the metadata for the face so we can keep track of how recently we have seen this face.
-            
+
             metadata["firstSeenThisInteraction"] = datetime.now().replace(tzinfo=None)
             metadata["lastSeen"] = datetime.now().replace(tzinfo=None)
             metadata["seenCount"] += 1
@@ -532,7 +599,6 @@ def lookup_known_face(face_encoding,  currentTime):
             # We'll also keep a total "seen count" that tracks how many times this person has come to the door.
             # But we can say that if we have seen this person within the last 5 minutes, it is still the same
             # visit, not a new visit. But if they go away for awhile and come back, that is a new visit.
-            
 
     except:
         pass
@@ -591,7 +657,7 @@ class SensorFactory(GstRtspServer.RTSPMediaFactory):
             if self.number_frames % self.fps == 0:
                 frame = face_recog(frame, currentTime)
                 if debug:
-                        print("face recog")
+                    print("face recog")
             data = frame.tostring()
             buf = Gst.Buffer.new_allocate(None, len(data), None)
             buf.fill(0, data)
@@ -696,28 +762,32 @@ if __name__ == "__main__":
     known_face_encodings = []
     known_face_metadata = []
     load_known_faces()
-    # s.starttls() 
-    mail_service.login(parser["APP_CONFIG"].get("SMID"), parser["APP_CONFIG"].get("SMPK"))
-    push_service = FCMNotification(api_key=parser["APP_CONFIG"].get("MSAK"))  
+    # s.starttls()
+    mail_service.login(
+        parser["APP_CONFIG"].get("SMID"), parser["APP_CONFIG"].get("SMPK")
+    )
+    push_service = FCMNotification(api_key=parser["APP_CONFIG"].get("MSAK"))
     facedata_collection = db.collection(parser["CLOUD_CONFIG"].get("FAD"))
     trainface_collection = db.collection(parser["CLOUD_CONFIG"].get("TFD"))
     intruder_collection = db.collection(parser["CLOUD_CONFIG"].get("LOG"))
-    camera_doc = db.document(parser["CLOUD_CONFIG"].get("CAM"), parser["APP_CONFIG"].get("CameraID"))
-    ip = socket.gethostbyname(socket.gethostname())
-    camera_doc.update({"url":"rtsp://"+ip+":8554/video", "statusOn" : True})
+    camera_doc = db.document(
+        parser["CLOUD_CONFIG"].get("CAM"), parser["APP_CONFIG"].get("CameraID")
+    )
+    camera_doc.update(
+        {"url": "rtsp://" + get_current_ip() + ":8554/video", "statusOn": True}
+    )
 
     model_mode = camera_doc.get().to_dict()["mode"]
 
     facedata_notifier = facedata_collection.on_snapshot(face_data_changed)
     trainface_notifier = trainface_collection.on_snapshot(new_face_added)
-    # camera_notifier = camera_doc.on_snapshot(camera_meta_changed)
+    camera_notifier = camera_doc.on_snapshot(camera_meta_changed)
 
     server = GstServer()
     server.connect("client-connected", route2stream, None)
 
     offline = True
 
-    
     sur_thread.start()
 
     if debug:
