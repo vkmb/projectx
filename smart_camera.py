@@ -40,6 +40,7 @@ configPath = "config.ini"
 model_options = {"Good": "hog", "Best": "cnn"}
 model_mode = "Good"
 push_service = None
+no_datachange = True
 mail_service = smtplib.SMTP("smtp.gmail.com", 587)
 mail_service.starttls()
 notification_time = datetime.now()
@@ -120,8 +121,10 @@ def wrap_it_up(p1, p2):
 
         save_known_faces()
 
-        global mainloop, db, bucket, facedata_collection, facedata_notifier, trainface_notifier, camera_doc, mail_service, push_service, camera_notifier, camera
-
+        global mainloop, db, bucket, facedata_collection, facedata_notifier, trainface_notifier, camera_doc, mail_service, push_service, camera_notifier, camera, sur_thread
+        if sur_thread.is_alive():
+            sur_thread.join(1)
+        mainloop.quit()
         camera_doc.update({"statusOn": False, "lastSeen": datetime.now()})
         mail_service.quit()
 
@@ -136,7 +139,6 @@ def wrap_it_up(p1, p2):
         del facedata_notifier
         del trainface_notifier
 
-        mainloop.quit()
     except:
         # mainloop was not created
         pass
@@ -176,7 +178,7 @@ def get_jetson_gstreamer_source(
     display_width=1280,
     display_height=720,
     framerate=30,
-    flip_method=0,
+    flip_method=2,
 ):
     """
     Function Usage : 
@@ -203,13 +205,15 @@ def get_jetson_gstreamer_source(
 
 
 def survillence():
-    global camera, offline, debug
+    global camera, offline, debug, no_datachange
     while offline:
         currentTime = datetime.now()
         _, frame = camera.read()
-        if _:
+        if _ and no_datachange:
             face_recog(frame, currentTime)
             # threading.Thread(target=face_recog, args=(frame, currentTime), daemon=True).start()
+        if not no_datachange and debug:
+            print("Survillance stopped")
 
 
 sur_thread = threading.Thread(target=survillence, daemon=True)
@@ -217,7 +221,7 @@ sur_thread = threading.Thread(target=survillence, daemon=True)
 
 def face_recog(frame, currentTime=None):
 
-    global debug, log_document_template, db, bucket, devId, frequency, parser, intruder_collection, model_options, model_mode, notification_time, frequency
+    global debug, log_document_template, db, bucket, devId, frequency, parser, intruder_collection, model_options, model_mode, notification_time, frequency, no_datachange, known_face_metadata
 
     temp_log_document = copy.deepcopy(log_document_template)
 
@@ -252,6 +256,7 @@ def face_recog(frame, currentTime=None):
         else:
             face_label = "New visitor!"
             new_face_detected = True
+            no_datachange = False
             # Grab the image of the the face from the current frame of video
             top, right, bottom, left = face_location
             face_image = small_frame[top:bottom, left:right]
@@ -267,6 +272,8 @@ def face_recog(frame, currentTime=None):
         face_labels.append(face_label)
 
         temp_log_document["peopleDetected"].append(doc_id_path)
+
+        no_datachange = True
 
     # Draw a box around each face and label each face
     for (top, right, bottom, left), face_label in zip(face_locations, face_labels):
@@ -290,7 +297,10 @@ def face_recog(frame, currentTime=None):
             (255, 255, 255),
             1,
         )
-    if datetime.now() - notification_time > timedelta(minutes=frequency):
+    if (
+        datetime.now() - notification_time > timedelta(minutes=frequency)
+        or new_face_detected
+    ):
         if debug:
             print("Logging - new face ", new_face_detected)
 
@@ -383,6 +393,8 @@ def save_known_faces():
 def load_known_faces():
     global known_face_encodings, known_face_metadata
     sync_it_to_local()
+    with open("known_faces.dat", "rb") as face_data_file:
+        known_face_encodings, known_face_metadata = pickle.load(face_data_file)
 
 
 def camera_meta_changed(document_snapshot, changes, read_time):
@@ -391,7 +403,7 @@ def camera_meta_changed(document_snapshot, changes, read_time):
         if change.type.name == "MODIFIED":
             temp_doc = change.document.to_dict()
             ip = socket.gethostbyname(socket.gethostname())
-            if not temp_doc["url"].contains(ip):
+            if ip not in temp_doc["url"]:
                 camera_doc.update({"url": "rtsp://" + ip + ":8554/video"})
             if temp_doc["mode"] != model_mode:
                 model_mode = temp_doc["mode"]
@@ -403,7 +415,7 @@ def send_notifications():
     for temp_doc in known_face_metadata:
         time_interval = datetime.now() - temp_doc["lastSeen"].replace(tzinfo=None)
         if temp_doc["mailOn"] and timedelta(
-            minutes=frequency / frequency
+            minutes=frequency / (frequency * 10)
         ) < time_interval < timedelta(minutes=10):
             mail_message += (
                 "\r\n * "
@@ -445,10 +457,12 @@ def send_notifications():
 
 def face_data_changed(collection_snapshot, changes, read_time):
 
-    global db, bucket, known_face_metadata, debug, known_face_encodings, mail_service, push_service, parser
+    global db, bucket, known_face_metadata, debug, known_face_encodings, mail_service, push_service, parser, no_datachange
     to_be_removed_userId, temp_metadata, temp_face_encodings = [], [], []
+    no_datachange = False
     if debug:
         print("Number of known people : ", len(known_face_metadata))
+
     flag = False
     for change in changes:
         if change.type.name == "MODIFIED" or change.type.name == "ADDED":
@@ -466,24 +480,22 @@ def face_data_changed(collection_snapshot, changes, read_time):
                     known_face_encodings.append(np.frombuffer(temp_doc["faceEncoding"]))
             if debug:
                 print("{} face id updated".format(temp_doc["userId"]))
-        if change.type.name == "REMOVED":
-            flag = True
-            temp_doc = change.document.to_dict()
-            for index in known_face_metadata:
-                if index["userId"] == temp_doc["userId"]:
-                    to_be_removed_userId.append(index["userId"])
-            if debug:
-                print("{} face id deleted".format(temp_doc["userId"]))
-    if flag:
-        for index in known_face_metadata:
-            if index["userId"] not in to_be_removed_userId:
-                temp_metadata.append(index)
-                temp_face_encodings.append(index["faceEncoding"])
-        known_face_metadata, known_face_encodings = (
-            copy.deepcopy(temp_metadata),
-            copy.deepcopy(temp_face_encodings),
-        )
-    del temp_metadata, temp_face_encodings
+    #     if change.type.name == "REMOVED":
+    #         flag = True
+    #         temp_doc = change.document.to_dict()
+    #         to_be_removed_userId.append(temp_doc["userId"])
+    #         if debug:
+    #             print("{} face id deleted".format(temp_doc["userId"]))
+    # if flag:
+    #     for index in known_face_metadata:
+    #         if index["userId"] not in to_be_removed_userId:
+    #             temp_metadata.append(index)
+    #             temp_face_encodings.append(index["faceEncoding"])
+
+    #     known_face_metadata = copy.deepcopy(temp_metadata)
+    #     known_face_encodings = copy.deepcopy(temp_face_encodings)
+    # del temp_metadata, temp_face_encodings
+    no_datachange = True
     save_known_faces()
 
 
@@ -595,6 +607,8 @@ def lookup_known_face(face_encoding, currentTime):
             metadata["firstSeenThisInteraction"] = datetime.now().replace(tzinfo=None)
             metadata["lastSeen"] = datetime.now().replace(tzinfo=None)
             metadata["seenCount"] += 1
+            if debug:
+                print("id : ", metadata["userId"])
 
             # We'll also keep a total "seen count" that tracks how many times this person has come to the door.
             # But we can say that if we have seen this person within the last 5 minutes, it is still the same
@@ -647,7 +661,7 @@ class SensorFactory(GstRtspServer.RTSPMediaFactory):
             "! rtph264pay config-interval=1 name=pay0 pt=96".format(self.fps)
         )
         if sur_thread.is_alive():
-            sur_thread.exit()
+            sur_thread.join(1)
 
     def on_need_data(self, src, lenght):
         global offline
