@@ -16,6 +16,7 @@ import gi
 import cv2
 import sys
 import copy
+import time
 import pickle
 import signal
 import socket
@@ -118,16 +119,15 @@ def wrap_it_up(p1, p2):
      - Exits the main thread
     """
     try:
-
-        save_known_faces()
-
+        
         global mainloop, db, bucket, facedata_collection, facedata_notifier, trainface_notifier, camera_doc, mail_service, push_service, camera_notifier, camera, sur_thread
+        camera_doc.update({"statusOn": False, "lastSeen": datetime.now()})
+        save_known_faces()
         if sur_thread.is_alive():
             sur_thread.join(1)
-        mainloop.quit()
-        camera_doc.update({"statusOn": False, "lastSeen": datetime.now()})
+        if sig == signal.SIGINT:
+            mainloop.quit()
         mail_service.quit()
-
         facedata_notifier.unsubscribe()
         trainface_notifier.unsubscribe()
         camera_notifier.unsubscribe()
@@ -223,7 +223,7 @@ def face_recog(frame, currentTime=None):
 
     global debug, log_document_template, db, bucket, devId, frequency, parser, intruder_collection, model_options, model_mode, notification_time, frequency, no_datachange, known_face_metadata
 
-    temp_log_document = copy.deepcopy(log_document_template)
+    temp_log_document = copy.copy(log_document_template)
 
     permFileName = (
         devId + "_" + str(currentTime).replace(" ", "_").replace(":", "_") + ".jpg"
@@ -302,7 +302,7 @@ def face_recog(frame, currentTime=None):
         or new_face_detected
     ):
         if debug:
-            print("Logging - new face ", new_face_detected)
+            print("[ {} ] Logging | New Face {}".format(time.ctime(), new_face_detected))
 
         if logging:
             cv2.imwrite(permFileName, frame)
@@ -340,7 +340,7 @@ def face_recog(frame, currentTime=None):
             del temp_log_document
             del tempIntruderLogDocument
             os.remove(permFileName)
-        send_notifications()
+        threading.Thread(target=send_notifications, daemon=True).start()
         notification_time = datetime.now()
     return frame
 
@@ -360,7 +360,7 @@ def register_new_face(face_encoding, face_image):
     known_face_encodings.append(face_encoding)
     # Add a matching dictionary entry to our metadata list.
     # We can use this to keep track of how many times a person has visited, when we last saw them, etc.
-    temp_facedata_document = copy.deepcopy(face_data_template)
+    temp_facedata_document = copy.copy(face_data_template)
     temp_facedata_document["editedOn"] = datetime.now()
     temp_facedata_document["firstSeen"] = datetime.now()
     temp_facedata_document["faceEncoding"] = face_encoding.tostring()
@@ -379,7 +379,7 @@ def register_new_face(face_encoding, face_image):
 
     save_known_faces()
     if debug:
-        print("New Face added")
+        print("[ {} ] New Face added".format(time.ctime()))
     return document.id
 
 
@@ -410,13 +410,13 @@ def camera_meta_changed(document_snapshot, changes, read_time):
 
 
 def send_notifications():
-    global known_face_metadata, debug, known_face_encodings, mail_service, push_service, parser, notification_time, frequency
+    global known_face_metadata, debug, mail_service, push_service, parser, notification_time, frequency
     mail_message, push_message = "", ""
     for temp_doc in known_face_metadata:
         time_interval = datetime.now() - temp_doc["lastSeen"].replace(tzinfo=None)
         if temp_doc["mailOn"] and timedelta(
-            minutes=frequency / (frequency * 10)
-        ) < time_interval < timedelta(minutes=10):
+           seconds=frequency
+        ) < time_interval < timedelta(minutes=frequency):
             mail_message += (
                 "\r\n * "
                 + temp_doc["label"]
@@ -426,8 +426,8 @@ def send_notifications():
                 + parser["APP_CONFIG"].get("CameraName")
             )
         if temp_doc["pushOn"] and timedelta(
-            minutes=frequency / frequency
-        ) < time_interval < timedelta(minutes=10):
+           seconds=frequency
+        ) < time_interval < timedelta(minutes=frequency):
             push_message += (
                 "\r\n * "
                 + temp_doc["label"]
@@ -444,7 +444,7 @@ def send_notifications():
             "Subject: Inturder Alert \n" + mail_message,
         )
         if debug:
-            print("sent mail notification")
+            print("{} sent mail notification".format(time.ctime()))
 
     if len(push_message):
         push_service.notify_topic_subscribers(
@@ -452,48 +452,64 @@ def send_notifications():
             message_body="Inturder Alert \n" + push_message,
         )
         if debug:
-            print("sent app notification")
+            print("{} sent app notification".format(time.ctime()))
 
 
 def face_data_changed(collection_snapshot, changes, read_time):
 
-    global db, bucket, known_face_metadata, debug, known_face_encodings, mail_service, push_service, parser, no_datachange
+    global known_face_metadata, debug, known_face_encodings, no_datachange
     to_be_removed_userId, temp_metadata, temp_face_encodings = [], [], []
+    # known_face_metadata , known_face_encodings = [], []
+
     no_datachange = False
     if debug:
         print("Number of known people : ", len(known_face_metadata))
 
-    flag = False
+    # for doc in collection_snapshot:
+    #     temp = doc.to_dict()
+    #     known_face_metadata.append(temp)
+    #     known_face_encodings.append(temp["faceEncoding"])
+
+    # flag = False
     for change in changes:
         if change.type.name == "MODIFIED" or change.type.name == "ADDED":
             temp_doc = change.document.to_dict()
             if temp_doc == {}:
                 continue
             if change.type.name == "MODIFIED":
-                for doc in known_face_metadata:
-                    if doc["userId"] == temp_doc["userId"]:
-                        doc = temp_doc
+                for index in range(len(known_face_metadata)):
+                    if known_face_metadata[index]["userId"] == temp_doc["userId"]:
+                        known_face_metadata[index]["label"] = temp_doc["label"]
+                        known_face_metadata[index]["editedOn"] = temp_doc["editedOn"]
+                        known_face_metadata[index]["mailOn"] = temp_doc["mailOn"]
+                        known_face_metadata[index]["pushOn"] = temp_doc["pushOn"]
+
             elif change.type.name == "ADDED":
                 doc_id_list = [doc["userId"] for doc in known_face_metadata]
-                if change.document.id not in doc_id_list:
+                if temp_doc["userId"] not in doc_id_list:
                     known_face_metadata.append(temp_doc)
                     known_face_encodings.append(np.frombuffer(temp_doc["faceEncoding"]))
             if debug:
                 print("{} face id updated".format(temp_doc["userId"]))
-    #     if change.type.name == "REMOVED":
-    #         flag = True
-    #         temp_doc = change.document.to_dict()
-    #         to_be_removed_userId.append(temp_doc["userId"])
-    #         if debug:
-    #             print("{} face id deleted".format(temp_doc["userId"]))
+
+        if change.type.name == "REMOVED":
+            flag = True
+            temp_doc = change.document.to_dict()
+            to_be_removed_userId.append(temp_doc["userId"])
+            for index in range(len(known_face_metadata)):
+                if known_face_metadata[index]["userId"] == temp_doc["userId"]:
+                    del known_face_metadata[index]
+                    del known_face_encodings[index]
+            if debug:
+                print("{} face id deleted".format(temp_doc["userId"]))
     # if flag:
     #     for index in known_face_metadata:
     #         if index["userId"] not in to_be_removed_userId:
     #             temp_metadata.append(index)
     #             temp_face_encodings.append(index["faceEncoding"])
-
-    #     known_face_metadata = copy.deepcopy(temp_metadata)
-    #     known_face_encodings = copy.deepcopy(temp_face_encodings)
+    #     known_face_metadata, known_face_encodings = [], []
+    #     known_face_metadata = copy.copy(temp_metadata)
+    #     known_face_encodings = copy.copy(temp_face_encodings)
     # del temp_metadata, temp_face_encodings
     no_datachange = True
     save_known_faces()

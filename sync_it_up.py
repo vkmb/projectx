@@ -35,8 +35,7 @@ face_data_template = {
     "userId": "",  # unique id of document in collection
 }
 
-
-def sync_it_to_local():
+def restore_it_to_local():
     # Updates the known_faces.dat if it exsists
     # Otherwise downloads all the facedata_collection
     # and creates the know_faces.dat
@@ -79,6 +78,47 @@ def sync_it_to_local():
                     known_face_metadata.append(tmpdoc)
                     # os.remove(doc.id + "_faceImage.jpg")
                     count += 1
+
+        with open("known_faces.dat", "wb") as face_data_file:
+            face_data = [known_face_encodings, known_face_metadata]
+            pickle.dump(face_data, face_data_file)
+            print("{} faces backed up to disk.".format(count))
+            # known_face_metadata
+    else:
+        raise FileNotFoundError
+
+def sync_it_to_local():
+    # Updates the known_faces.dat if it exsists
+    # Otherwise downloads all the facedata_collection
+    # and creates the know_faces.dat
+    configPath = "config.ini"
+    parser = configparser.ConfigParser()
+    result = parser.read(configPath)
+    # os.remove("known_faces.dat")
+    count = 0
+    # In a folder, each file should have a unique name, if the result is not null
+    # then the file exists otherwise file is not found.
+    if len(result) == 1:
+        filePath = parser["CLOUD_CONFIG"].get("SFP")
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(filePath)
+        db = firestore.Client()
+        bucket = storage.Client().get_bucket(db.project + ".appspot.com")
+        facedata_collection = db.collection(parser["CLOUD_CONFIG"].get("FAD"))
+        filename = "known_faces.dat"
+        known_face_encodings, known_face_metadata, = [], []
+
+        for doc in facedata_collection.stream():
+            tmpdoc = doc.to_dict()
+            if "faceEncoding" in tmpdoc.keys() and len(tmpdoc["faceEncoding"]) != 0:
+                face_image_blob = bucket.blob(tmpdoc["imageUri"])
+                face_image_blob.download_to_filename(
+                    filename=doc.id + "_faceImage.jpg"
+                )
+                image = cv2.imread(doc.id + "_faceImage.jpg")
+                known_face_encodings.append(np.frombuffer(tmpdoc["faceEncoding"]))
+                known_face_metadata.append(tmpdoc)
+                os.remove(doc.id + "_faceImage.jpg")
+                count += 1
 
         with open("known_faces.dat", "wb") as face_data_file:
             face_data = [known_face_encodings, known_face_metadata]
