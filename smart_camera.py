@@ -502,15 +502,7 @@ def face_data_changed(collection_snapshot, changes, read_time):
                     del known_face_encodings[index]
             if debug:
                 print("{} face id deleted".format(temp_doc["userId"]))
-    # if flag:
-    #     for index in known_face_metadata:
-    #         if index["userId"] not in to_be_removed_userId:
-    #             temp_metadata.append(index)
-    #             temp_face_encodings.append(index["faceEncoding"])
-    #     known_face_metadata, known_face_encodings = [], []
-    #     known_face_metadata = copy.copy(temp_metadata)
-    #     known_face_encodings = copy.copy(temp_face_encodings)
-    # del temp_metadata, temp_face_encodings
+
     no_datachange = True
     save_known_faces()
 
