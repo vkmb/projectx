@@ -20,8 +20,6 @@ import signal
 import imutils
 import platform
 import threading
-from imutils.video import FPS, WebcamVideoStream
-
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
@@ -68,7 +66,7 @@ class SensorFactory(GstRtspServer.RTSPMediaFactory):
         super(SensorFactory, self).__init__(**properties)
         self.cap = camera
         self.number_frames = 0
-        self.fps = 15
+        self.fps = 2
         self.duration = 1 / self.fps * Gst.SECOND  # duration of a frame in nanoseconds
         self.launch_string = (
             "appsrc name=source is-live=true block=true format=GST_FORMAT_TIME "
@@ -81,9 +79,10 @@ class SensorFactory(GstRtspServer.RTSPMediaFactory):
     def on_need_data(self, src, lenght):
         global offline
         # if self.cap.isOpened():
-        frame = self.cap.read()
+        _, frame = self.cap.read()
             # if ret:
                 # Resize frame of video to 1/4 size for faster face recognition processing
+        assert _==True
         data = frame.tostring()
         buf = Gst.Buffer.new_allocate(None, len(data), None)
         buf.fill(0, data)
@@ -154,8 +153,7 @@ if __name__ == "__main__":
         camera = cv2.VideoCapture(get_jetson_gstreamer_source(), cv2.CAP_GSTREAMER)
 
     else:
-        # camera = cv2.VideoCapture(0)
-        camera = WebcamVideoStream(src=0)
+        camera = cv2.VideoCapture(0)
 
     if debug:
         if camera is not None:
