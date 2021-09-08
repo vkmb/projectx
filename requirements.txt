@@ -34,7 +34,7 @@ requests-toolbelt==0.7.0
 rsa==4.0
 shellescape==3.4.1
 six==1.13.0
-urllib3==1.25.6
+urllib3==1.26.5
 wcwidth==0.1.7
 websocket-client==0.56.0
 wrapt==1.11.2
