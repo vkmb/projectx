@@ -20,7 +20,7 @@ numpy==1.17.3
 oauth2client==3.0.0
 opencv-contrib-python==4.1.1.26
 pathspec==0.6.0
-Pillow==8.3.2
+Pillow==9.0.0
 pluggy==0.13.0
 protobuf==3.10.0
 pycairo==1.18.2
