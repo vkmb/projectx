@@ -26,7 +26,7 @@ protobuf==3.10.0
 pycairo==1.18.2
 pycryptodome==3.6.6
 PyGObject==3.34.0
-python-jwt==2.0.1
+python-jwt==3.3.4
 pytz==2019.3
 regex==2019.11.1
 requests==2.22.0
